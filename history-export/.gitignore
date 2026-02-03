@@ -7,6 +7,9 @@ dist/
 # Export output
 exports/
 
+# Cache
+.cache/
+
 # Environment variables
 .env
 

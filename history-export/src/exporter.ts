@@ -1,16 +1,33 @@
 import path from "path";
 import os from "os";
-import { mkdir, writeFile } from "fs/promises";
-import { WebClient, WebAPICallResult, LogLevel } from "@slack/web-api";
+import { mkdir, writeFile, readFile } from "fs/promises";
+import {
+  WebClient,
+  WebAPICallResult,
+  LogLevel,
+  retryPolicies,
+  ErrorCode,
+  type CodedError,
+} from "@slack/web-api";
 import type {
   ConversationsHistoryResponse,
   ConversationsRepliesResponse,
   ConversationsInfoResponse,
   ConversationsListResponse,
   UsersInfoResponse,
+  UsersListResponse,
 } from "@slack/web-api";
 
 type SlackMessage = NonNullable<ConversationsHistoryResponse["messages"]>[number];
+type SlackUser = NonNullable<UsersListResponse["members"]>[number];
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitError(error: unknown): boolean {
+  return (error as CodedError)?.code === ErrorCode.RateLimitedError;
+}
 
 export interface ExportOptions {
   channelId: string;
@@ -30,19 +47,154 @@ interface MessageWithReplies {
   replies: SlackMessage[];
 }
 
+interface ChannelCacheFile {
+  updatedAt: string;
+  channels: Record<string, string>; // name -> id
+}
+
+interface UserCacheFile {
+  updatedAt: string;
+  users: Record<string, string>; // id -> displayName
+}
+
+interface ChannelInfo {
+  id: string;
+  name: string;
+}
+
 export class HistoryExporter {
   private readonly client: WebClient;
   private readonly userCache = new Map<string, string>();
-  private readonly channelCache = new Map<string, string>();
+  private readonly channelNameToIdCache = new Map<string, string>();
+  private readonly channelIdToNameCache = new Map<string, string>();
+  private readonly cacheDir: string;
 
-  constructor(token: string) {
+  constructor(token: string, cacheDir: string = ".cache") {
     if (!token) {
       throw new Error("SLACK_USER_TOKEN is required to export history");
     }
 
+    this.cacheDir = cacheDir;
     this.client = new WebClient(token, {
-      logLevel: LogLevel.INFO,
+      logLevel: LogLevel.WARN,
+      retryConfig: retryPolicies.fiveRetriesInFiveMinutes,
+      rejectRateLimitedCalls: false,
     });
+  }
+
+  private get channelCacheFilePath(): string {
+    return path.join(this.cacheDir, "channels.json");
+  }
+
+  private get userCacheFilePath(): string {
+    return path.join(this.cacheDir, "users.json");
+  }
+
+  private async loadChannelCacheFromFile(): Promise<ChannelCacheFile | null> {
+    try {
+      const data = await readFile(this.channelCacheFilePath, "utf8");
+      return JSON.parse(data) as ChannelCacheFile;
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveChannelCacheToFile(
+    channels: Record<string, string>
+  ): Promise<void> {
+    await mkdir(this.cacheDir, { recursive: true });
+    const cache: ChannelCacheFile = {
+      updatedAt: new Date().toISOString(),
+      channels,
+    };
+    await writeFile(
+      this.channelCacheFilePath,
+      JSON.stringify(cache, null, 2),
+      "utf8"
+    );
+  }
+
+  private async loadUserCacheFromFile(): Promise<UserCacheFile | null> {
+    try {
+      const data = await readFile(this.userCacheFilePath, "utf8");
+      return JSON.parse(data) as UserCacheFile;
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveUserCacheToFile(
+    users: Record<string, string>
+  ): Promise<void> {
+    await mkdir(this.cacheDir, { recursive: true });
+    const cache: UserCacheFile = {
+      updatedAt: new Date().toISOString(),
+      users,
+    };
+    await writeFile(
+      this.userCacheFilePath,
+      JSON.stringify(cache, null, 2),
+      "utf8"
+    );
+  }
+
+  async prefetchUsersToCache(refreshCache: boolean = false): Promise<number> {
+    await this.prefetchUsers(refreshCache);
+    return this.userCache.size;
+  }
+
+  async listChannels(refreshCache: boolean = false): Promise<ChannelInfo[]> {
+    // Try to use cached data if not forcing refresh
+    if (!refreshCache) {
+      const cachedData = await this.loadChannelCacheFromFile();
+      if (cachedData) {
+        console.log(
+          `Using cached channel list from ${cachedData.updatedAt}`
+        );
+        const channels: ChannelInfo[] = Object.entries(cachedData.channels).map(
+          ([name, id]) => ({ name, id })
+        );
+        channels.sort((a, b) => a.name.localeCompare(b.name));
+        return channels;
+      }
+    }
+
+    console.log("Fetching channel list from Slack API...");
+    const channels: ChannelInfo[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const response = (await this.client.conversations.list({
+        cursor,
+        limit: 200,
+        types: "public_channel,private_channel",
+      })) as ConversationsListResponse & WebAPICallResult;
+
+      if (!response.ok) {
+        throw new Error(
+          `Failed to list channels: ${response.error ?? "unknown_error"}`
+        );
+      }
+
+      for (const ch of response.channels ?? []) {
+        if (ch.id && ch.name) {
+          channels.push({ id: ch.id, name: ch.name });
+        }
+      }
+
+      cursor = response.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+
+    // Save to cache file
+    const cacheData: Record<string, string> = {};
+    for (const ch of channels) {
+      cacheData[ch.name] = ch.id;
+    }
+    await this.saveChannelCacheToFile(cacheData);
+    console.log(`Channel cache saved to ${this.channelCacheFilePath}`);
+
+    channels.sort((a, b) => a.name.localeCompare(b.name));
+    return channels;
   }
 
   async export(options: ExportOptions): Promise<ExportResult> {
@@ -60,6 +212,9 @@ export class HistoryExporter {
     console.log(`Found ${messages.length} messages`);
 
     const messagesWithReplies = await this.expandThreads(channelId, messages);
+
+    // Prefetch all users to avoid rate limits during formatting
+    await this.prefetchUsers();
 
     const content =
       options.format === "csv"
@@ -82,13 +237,39 @@ export class HistoryExporter {
   }
 
   private async resolveChannelId(channelIdOrName: string): Promise<string> {
+    // If it's already an ID, return as-is
     if (channelIdOrName.startsWith("C") || channelIdOrName.startsWith("G")) {
       return channelIdOrName;
     }
 
     const normalizedName = channelIdOrName.replace(/^#/, "");
 
+    // Check in-memory cache first
+    const cached = this.channelNameToIdCache.get(normalizedName);
+    if (cached) {
+      return cached;
+    }
+
+    // Try to load from file cache
+    const cachedData = await this.loadChannelCacheFromFile();
+    if (cachedData) {
+      const channelId = cachedData.channels[normalizedName];
+      if (channelId) {
+        // Populate in-memory caches
+        for (const [name, id] of Object.entries(cachedData.channels)) {
+          this.channelNameToIdCache.set(name, id);
+          this.channelIdToNameCache.set(id, name);
+        }
+        console.log(`Using channel ID from cache: ${normalizedName} -> ${channelId}`);
+        return channelId;
+      }
+    }
+
+    // Fallback: fetch from API
+    console.log("Channel not in cache, fetching from Slack API...");
     let cursor: string | undefined;
+    const allChannels: Record<string, string> = {};
+
     do {
       const response = (await this.client.conversations.list({
         cursor,
@@ -102,16 +283,25 @@ export class HistoryExporter {
         );
       }
 
-      const channel = response.channels?.find(
-        (ch) => ch.name === normalizedName || ch.name_normalized === normalizedName
-      );
-
-      if (channel?.id) {
-        return channel.id;
+      for (const ch of response.channels ?? []) {
+        if (ch.id && ch.name) {
+          allChannels[ch.name] = ch.id;
+          this.channelNameToIdCache.set(ch.name, ch.id);
+          this.channelIdToNameCache.set(ch.id, ch.name);
+        }
       }
 
       cursor = response.response_metadata?.next_cursor || undefined;
     } while (cursor);
+
+    // Save to cache file for next time
+    await this.saveChannelCacheToFile(allChannels);
+    console.log(`Channel cache saved to ${this.channelCacheFilePath}`);
+
+    const channelId = allChannels[normalizedName];
+    if (channelId) {
+      return channelId;
+    }
 
     throw new Error(`Channel not found: ${channelIdOrName}`);
   }
@@ -197,16 +387,30 @@ export class HistoryExporter {
   ): Promise<MessageWithReplies[]> {
     const result: MessageWithReplies[] = [];
 
+    // Count threads to fetch for progress display
+    const threadsToFetch = messages.filter(
+      (m) => m.thread_ts && m.reply_count && m.reply_count > 0
+    );
+    let threadIndex = 0;
+
     for (const message of messages) {
       const replies: SlackMessage[] = [];
 
       if (message.thread_ts && message.reply_count && message.reply_count > 0) {
-        console.log(`  Fetching ${message.reply_count} replies for thread...`);
+        threadIndex++;
+        console.log(
+          `  Fetching thread ${threadIndex}/${threadsToFetch.length} (${message.reply_count} replies)...`
+        );
         const threadReplies = await this.fetchThreadReplies(
           channelId,
           message.thread_ts
         );
         replies.push(...threadReplies);
+
+        // Throttle to avoid rate limits (100ms between thread fetches)
+        if (threadIndex < threadsToFetch.length) {
+          await delay(100);
+        }
       }
 
       result.push({ message, replies });
@@ -216,11 +420,26 @@ export class HistoryExporter {
   }
 
   private async getChannelName(channelId: string): Promise<string> {
-    const cached = this.channelCache.get(channelId);
+    // Check in-memory cache first
+    const cached = this.channelIdToNameCache.get(channelId);
     if (cached) {
       return cached;
     }
 
+    // Try to load from file cache
+    const cachedData = await this.loadChannelCacheFromFile();
+    if (cachedData) {
+      for (const [name, id] of Object.entries(cachedData.channels)) {
+        this.channelNameToIdCache.set(name, id);
+        this.channelIdToNameCache.set(id, name);
+      }
+      const cachedName = this.channelIdToNameCache.get(channelId);
+      if (cachedName) {
+        return cachedName;
+      }
+    }
+
+    // Fallback: fetch from API
     const response = (await this.client.conversations.info({
       channel: channelId,
     })) as ConversationsInfoResponse & WebAPICallResult;
@@ -237,8 +456,68 @@ export class HistoryExporter {
       response.channel.id ||
       channelId;
 
-    this.channelCache.set(channelId, name);
+    this.channelIdToNameCache.set(channelId, name);
     return name;
+  }
+
+  private async prefetchUsers(forceRefresh: boolean = false): Promise<void> {
+    // Try to load from file cache first
+    if (!forceRefresh) {
+      const cachedData = await this.loadUserCacheFromFile();
+      if (cachedData) {
+        for (const [id, name] of Object.entries(cachedData.users)) {
+          this.userCache.set(id, name);
+        }
+        console.log(
+          `Using cached user list (${Object.keys(cachedData.users).length} users) from ${cachedData.updatedAt}`
+        );
+        return;
+      }
+    }
+
+    console.log("Fetching user list from Slack API...");
+    let cursor: string | undefined;
+    let userCount = 0;
+
+    do {
+      const response = (await this.client.users.list({
+        cursor,
+        limit: 200,
+      })) as UsersListResponse & WebAPICallResult;
+
+      if (!response.ok) {
+        console.warn(`Warning: Failed to prefetch users: ${response.error}`);
+        return;
+      }
+
+      for (const member of response.members ?? []) {
+        if (member.id) {
+          this.userCache.set(member.id, this.extractDisplayName(member));
+          userCount++;
+        }
+      }
+
+      cursor = response.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+
+    // Save to file cache
+    const usersData: Record<string, string> = {};
+    for (const [id, name] of this.userCache.entries()) {
+      usersData[id] = name;
+    }
+    await this.saveUserCacheToFile(usersData);
+    console.log(`User cache saved to ${this.userCacheFilePath} (${userCount} users)`);
+  }
+
+  private extractDisplayName(user: SlackUser): string {
+    const profile = user.profile;
+    return (
+      profile?.display_name?.trim() ||
+      profile?.real_name?.trim() ||
+      user.real_name ||
+      user.id ||
+      "unknown"
+    );
   }
 
   private async getUserName(userId: string): Promise<string> {
@@ -247,6 +526,7 @@ export class HistoryExporter {
       return cached;
     }
 
+    // Fallback: fetch individual user if not in cache (e.g., deactivated users)
     try {
       const response = (await this.client.users.info({
         user: userId,
@@ -266,7 +546,10 @@ export class HistoryExporter {
 
       this.userCache.set(userId, displayName);
       return displayName;
-    } catch {
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        console.warn(`Rate limited while fetching user ${userId}, using ID`);
+      }
       this.userCache.set(userId, userId);
       return userId;
     }

@@ -10,6 +10,9 @@ interface CliArgs {
   to?: string;
   format?: "csv" | "markdown" | "yaml";
   output?: string;
+  listChannels?: boolean;
+  prefetchUsers?: boolean;
+  refreshCache?: boolean;
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -52,6 +55,15 @@ function parseArgs(args: string[]): CliArgs {
       case "-h":
         printUsage();
         process.exit(0);
+      case "--list-channels":
+        result.listChannels = true;
+        break;
+      case "--prefetch-users":
+        result.prefetchUsers = true;
+        break;
+      case "--refresh-cache":
+        result.refreshCache = true;
+        break;
     }
   }
 
@@ -79,20 +91,48 @@ Slack History Export
 
 Usage:
   npm run dev -- --channel <name|id> [options]
+  npm run dev -- --list-channels
+  npm run dev -- --prefetch-users
 
 Options:
-  --channel, -c <name|id>  Channel to export (required)
+  --channel, -c <name|id>  Channel to export (ID recommended to avoid rate limits)
+                           Example: --channel C01234567
+                           Use --list-channels to find channel IDs
   --from <YYYY-MM-DD>      Start date (optional)
   --to <YYYY-MM-DD>        End date (optional)
   --format, -f <yaml|csv|md>  Output format (default: yaml)
   --output, -o <dir>       Output directory (default: exports/)
+  --list-channels          List all channels and save to cache
+  --prefetch-users         Prefetch all users and save to cache
+  --refresh-cache          Force refresh cache from API
   --help, -h               Show this help
 
+Rate Limit Tips:
+  1. First run: npm run dev -- --list-channels --prefetch-users
+     This creates cache files to avoid rate limits on subsequent runs.
+  2. Use channel ID (C...) instead of channel name for faster execution.
+  3. Cache files are stored in .cache/ directory.
+
 Examples:
+  # Create all caches first (recommended)
+  npm run dev -- --list-channels
+  npm run dev -- --prefetch-users
+
+  # Export using channel ID (recommended, avoids rate limits)
+  npm run dev -- --channel C01234567
+
+  # Export using channel name (uses cache if available)
   npm run dev -- --channel general
-  npm run dev -- --channel general --from 2026-01-01 --to 2026-01-31
-  npm run dev -- --channel general --format csv
-  npm run dev -- -c general -f csv -o ./my-exports
+
+  # Date range filter
+  npm run dev -- --channel C01234567 --from 2026-01-01 --to 2026-01-31
+
+  # CSV format output
+  npm run dev -- --channel C01234567 --format csv
+
+  # Force refresh caches
+  npm run dev -- --list-channels --refresh-cache
+  npm run dev -- --prefetch-users --refresh-cache
 `);
 }
 
@@ -105,6 +145,38 @@ async function main(): Promise<void> {
     console.error("Error: SLACK_USER_TOKEN environment variable is required.");
     console.error("Copy .env.example to .env and set your token.");
     process.exit(1);
+  }
+
+  const exporter = new HistoryExporter(token);
+
+  // Handle --list-channels option
+  if (args.listChannels) {
+    try {
+      const channels = await exporter.listChannels(args.refreshCache ?? false);
+      console.log(`\nFound ${channels.length} channels:`);
+      for (const ch of channels) {
+        console.log(`  ${ch.name} (${ch.id})`);
+      }
+      console.log("");
+    } catch (error) {
+      console.error("Failed to list channels:", error);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Handle --prefetch-users option
+  if (args.prefetchUsers) {
+    try {
+      const userCount = await exporter.prefetchUsersToCache(
+        args.refreshCache ?? false
+      );
+      console.log(`\nCached ${userCount} users.`);
+    } catch (error) {
+      console.error("Failed to prefetch users:", error);
+      process.exit(1);
+    }
+    return;
   }
 
   if (!args.channel) {
@@ -120,8 +192,6 @@ async function main(): Promise<void> {
     format: args.format ?? "yaml",
     outputDir: args.output ?? path.resolve(process.cwd(), "exports"),
   };
-
-  const exporter = new HistoryExporter(token);
 
   try {
     const result = await exporter.export(options);
