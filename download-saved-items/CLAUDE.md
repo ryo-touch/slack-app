@@ -1,141 +1,131 @@
-# Claude.md - Technical Context for AI Assistants
+# CLAUDE.md - Later Export Tool
 
-This document provides comprehensive technical context about the slack-app repository for AI assistants working with this codebase.
+Slack「Later」（保存済みアイテム）エクスポートツールの技術コンテキスト。
 
-## Project Overview
+## プロジェクト概要
 
-**Type:** Slack Bot Application with Saved Items Export Functionality
-**Language:** TypeScript
-**Runtime:** Node.js
-**Framework:** Slack Bolt (@slack/bolt v4.6.0)
-**Build Tool:** TypeScript Compiler (tsc)
+- **種別:** Slack保存済みアイテムエクスポートツール
+- **言語:** TypeScript
+- **ランタイム:** Node.js
+- **フレームワーク:** Slack Bolt (@slack/bolt v4.6.0)
+- **ビルドツール:** TypeScript Compiler (tsc)
 
-## Repository Structure
+## ディレクトリ構造
 
 ```
-slack-app/
+download-saved-items/
 ├── src/
-│   ├── index.ts              # Main Slack Bolt app entry point
+│   ├── index.ts              # メインSlack Boltアプリエントリポイント
 │   ├── later/
-│   │   └── exporter.ts       # LaterExporter class for exporting saved items
+│   │   └── exporter.ts       # LaterExporterクラス
 │   └── scripts/
-│       └── exportLater.ts    # CLI script to run the exporter
-├── dist/                     # Compiled JavaScript output
-├── exports/                  # CSV export output directory
+│       └── exportLater.ts    # CLIスクリプト
+├── dist/                     # コンパイル済みJavaScript
+├── exports/                  # CSV出力先
 ├── docs/
-│   └── later-export-plan.md  # Detailed implementation plan
-├── .env.example              # Environment variable template
-├── package.json              # Dependencies and npm scripts
-└── tsconfig.json             # TypeScript configuration
+│   ├── later-export-plan.md  # 実装計画
+│   └── directory-structure-plan.md
+├── .env.example
+├── package.json
+└── tsconfig.json
 ```
 
-## Core Components
+## コアコンポーネント
 
-### 1. Main Slack App (src/index.ts)
+### 1. メインSlackアプリ (src/index.ts)
 
-**Purpose:** Initializes and runs the Slack Bolt application
+**用途:** Slack Boltアプリケーションの初期化と実行
 
-**Environment Variables:**
-- `SLACK_BOT_TOKEN` (required) - Bot OAuth token (xoxb-...)
-- `SLACK_SIGNING_SECRET` (required for HTTP mode) - App signing secret
-- `SLACK_APP_TOKEN` (required for Socket Mode) - App-level token (xapp-...)
-- `SLACK_SOCKET_MODE` (default: "false") - Enable/disable Socket Mode
-- `PORT` (default: 3000) - Server port for HTTP mode
+**環境変数:**
+- `SLACK_BOT_TOKEN` (必須) - Bot OAuth Token (xoxb-...)
+- `SLACK_SIGNING_SECRET` (HTTPモードで必須) - App signing secret
+- `SLACK_APP_TOKEN` (Socket Modeで必須) - App-level token (xapp-...)
+- `SLACK_SOCKET_MODE` (デフォルト: "false") - Socket Modeの有効/無効
+- `PORT` (デフォルト: 3000) - HTTPモードのサーバーポート
 
-**Features:**
-- Responds to `app_mention` events with a greeting
-- Supports both HTTP and Socket Mode
-- Basic error handling for missing environment variables
+**機能:**
+- `app_mention`イベントに挨拶で応答
+- HTTPとSocket Mode両対応
+- 環境変数未設定時の基本的なエラーハンドリング
 
-**Code Pattern:**
-```typescript
-app.event("app_mention", async ({ event, say }) => {
-  await say(`Hi, <@${event.user}>!`);
-});
-```
+### 2. LaterExporter (src/later/exporter.ts)
 
-### 2. Later Exporter (src/later/exporter.ts)
+**用途:** Slack「Later」（保存済みアイテム）をCSV形式でエクスポート
 
-**Purpose:** Exports Slack "Later" (saved items) to CSV format
+**クラス:** `LaterExporter`
 
-**Class:** `LaterExporter`
+**コンストラクタ:**
+- 適切なスコープを持つUser OAuth Token (xoxp-...) が必要
+- User TokenでWebClientを初期化
+- ユーザー名とチャンネル名のキャッシュを作成
 
-**Constructor:**
-- Requires a user OAuth token (xoxp-...) with appropriate scopes
-- Initializes WebClient with user token
-- Creates caches for user names and channel names
+**メインメソッド:** `run(outputDir?: string)`
+- ページネーションで全保存済みアイテムを収集
+- データをフラットなExportRowオブジェクトに正規化
+- `exports/later-export-{timestamp}.csv`にCSVを出力
+- 戻り値: `{ filePath: string, rowCount: number }`
 
-**Main Method:** `run(outputDir?: string)`
-- Collects all saved items via pagination
-- Normalizes data into flat ExportRow objects
-- Writes CSV to `exports/later-export-{timestamp}.csv`
-- Returns: `{ filePath: string, rowCount: number }`
+**必要なSlackスコープ (User Token):**
+- `stars:read` - 保存済みアイテムの読み取り
+- `channels:read`, `groups:read`, `im:read`, `mpim:read` - チャンネルメタデータ
+- `channels:history`, `groups:history`, `im:history`, `mpim:history` - メッセージ履歴
+- `users:read` - ユーザー情報
 
-**Required Slack Scopes (User Token):**
-- `stars:read` - Read saved items
-- `channels:read`, `groups:read`, `im:read`, `mpim:read` - Channel metadata
-- `channels:history`, `groups:history`, `im:history`, `mpim:history` - Message history
-- `users:read` - User information
+**エクスポートCSVカラム:**
+1. `savedAt` - アイテム保存時のISOタイムスタンプ
+2. `messageTs` - Slackメッセージタイムスタンプ
+3. `channelId` - チャンネル/会話ID
+4. `channelName` - 人間が読めるチャンネル名
+5. `userId` - ユーザーID（ボットの場合は "bot:{bot_id}"）
+6. `userDisplayName` - 表示名または本名
+7. `text` - サニタイズ済みメッセージテキスト（改行削除）
+8. `permalink` - 元メッセージへのリンク
 
-**Export CSV Columns:**
-1. `savedAt` - ISO timestamp when item was saved
-2. `messageTs` - Slack message timestamp
-3. `channelId` - Channel/conversation ID
-4. `channelName` - Human-readable channel name
-5. `userId` - User ID (or "bot:{bot_id}" for bots)
-6. `userDisplayName` - Display name or real name
-7. `text` - Sanitized message text (newlines removed)
-8. `permalink` - Clickable link to original message
+**実装詳細:**
+- `stars.list` APIでcursor-basedページネーション使用
+- API呼び出し削減のためユーザー・チャンネル名をキャッシュ
+- メッセージ詳細が不完全な場合は`conversations.history`にフォールバック
+- 改行をスペースに置換してテキストをサニタイズ
+- CSVエスケープ: クォートは二重化、`,` `"` 改行を含む場合はラップ
+- ファイル名のタイムスタンプ形式: `yyyyMMdd-HHmmss`
+- typeが"message"でchannelがあるアイテムのみをフィルタ
 
-**Implementation Details:**
-- Uses cursor-based pagination for `stars.list` API
-- Caches user and channel lookups to minimize API calls
-- Falls back to `conversations.history` if message details incomplete
-- Sanitizes text by replacing newlines with spaces
-- CSV escaping: quotes doubled, values wrapped if containing `,` `"` or newlines
-- Timestamp format: `yyyyMMdd-HHmmss` for filename
-- Filters to only include items of type "message" with a channel
+### 3. エクスポートスクリプト (src/scripts/exportLater.ts)
 
-### 3. Export Script (src/scripts/exportLater.ts)
+**用途:** 保存済みアイテムエクスポートのCLIエントリポイント
 
-**Purpose:** CLI entry point for exporting saved items
+**環境変数:**
+- `SLACK_USER_TOKEN` (必須) - User OAuth Token
 
-**Environment Variables:**
-- `SLACK_USER_TOKEN` (required) - User OAuth token
-
-**Usage:**
+**使用方法:**
 ```bash
-npm run export:later         # Development (ts-node)
-npm run export:later:build   # Production (compiled)
+npm run export:later         # 開発モード (ts-node)
+npm run export:later:build   # プロダクション (コンパイル済み)
 ```
 
-**Output:**
-- Success: Logs filepath and row count
-- Failure: Logs error and exits with code 1
+## 開発ワークフロー
 
-## Development Workflow
+### セットアップ
+1. `.env.example`を`.env`にコピー
+2. Slackトークンと認証情報を入力
+3. 依存関係インストール: `npm install`
 
-### Setup
-1. Copy `.env.example` to `.env`
-2. Fill in Slack tokens and credentials
-3. Install dependencies: `npm install`
+### スクリプト
+- `npm run dev` - 開発モードでメインアプリ実行 (ts-node)
+- `npm run build` - TypeScriptをJavaScriptにコンパイル
+- `npm start` - コンパイル済みメインアプリ実行
+- `npm run export:later` - 保存済みアイテムエクスポート (開発)
+- `npm run export:later:build` - 保存済みアイテムエクスポート (プロダクション)
 
-### Scripts
-- `npm run dev` - Run main app in development mode (ts-node)
-- `npm run build` - Compile TypeScript to JavaScript
-- `npm start` - Run compiled main app
-- `npm run export:later` - Export saved items (development)
-- `npm run export:later:build` - Export saved items (production)
-
-### TypeScript Configuration
+### TypeScript設定
 - Target: ES2020
 - Module: CommonJS
-- Strict mode enabled
+- Strictモード有効
 - Root: `src/` → Output: `dist/`
 
-## API Integration Patterns
+## APIパターン
 
-### Pagination Pattern
+### ページネーションパターン
 ```typescript
 let cursor: string | undefined;
 do {
@@ -145,7 +135,7 @@ do {
 } while (cursor);
 ```
 
-### Caching Pattern
+### キャッシュパターン
 ```typescript
 private readonly cache = new Map<string, string>();
 
@@ -159,7 +149,7 @@ async getCachedValue(key: string): Promise<string> {
 }
 ```
 
-### Error Handling Pattern
+### エラーハンドリングパターン
 ```typescript
 const response = await client.api.method(params) as ResponseType & WebAPICallResult;
 if (!response.ok) {
@@ -167,70 +157,48 @@ if (!response.ok) {
 }
 ```
 
-## Git History
+## 主要な依存関係
 
-Recent commits:
-- `d69f7dc` - "feature:later に保存されているメッセージを取得する" (Get saved messages from Later)
-- `e9c0caa` - "initial commit"
+**プロダクション:**
+- `@slack/bolt` ^4.6.0 - Slackアプリフレームワーク
+- `dotenv` ^17.2.3 - 環境変数読み込み
 
-## Key Dependencies
-
-**Production:**
-- `@slack/bolt` ^4.6.0 - Slack app framework
-- `dotenv` ^17.2.3 - Environment variable loading
-
-**Development:**
+**開発:**
 - `typescript` ^5.9.3
-- `ts-node` ^10.9.2 - Run TypeScript directly
+- `ts-node` ^10.9.2 - TypeScript直接実行
 - `@types/node` ^25.0.2
 
-## Common Tasks for AI Assistants
+## よくあるタスク
 
-### Adding New Event Handlers
-Add to `src/index.ts`:
-```typescript
-app.event("event_name", async ({ event, ... }) => {
-  // handler logic
-});
-```
+### エクスポートカラムの拡張
+1. `ExportColumn`型にカラム追加 (src/later/exporter.ts:20)
+2. `ExportRow`インターフェースにフィールド追加 (src/later/exporter.ts:30)
+3. `CSV_COLUMNS`配列に追加 (src/later/exporter.ts:41)
+4. `collectRows()`で新フィールドを設定 (src/later/exporter.ts:73)
 
-### Extending Export Columns
-1. Add column to `ExportColumn` type (src/later/exporter.ts:20)
-2. Add field to `ExportRow` interface (src/later/exporter.ts:30)
-3. Add to `CSV_COLUMNS` array (src/later/exporter.ts:41)
-4. Update `collectRows()` to populate new field (src/later/exporter.ts:73)
+### APIスコープの追加
+1. docs/later-export-plan.mdのスコープリストを更新
+2. Slackアプリ設定でワークスペースに再インストール
+3. `.env`の`SLACK_USER_TOKEN`を新トークンで更新
 
-### Adding New API Scopes
-1. Update scope list in docs/later-export-plan.md
-2. Reinstall app to workspace in Slack App settings
-3. Update `SLACK_USER_TOKEN` in `.env` with new token
+### デバッグ
+- `.env`ファイルのトークン値を確認
+- Slackアプリに必要なスコープがインストールされているか確認
+- ビルド後に`dist/`ディレクトリが存在するか確認
+- `exports/`ディレクトリで生成されたCSVファイルを確認
 
-### Debugging
-- Check `.env` file for correct token values
-- Verify Slack app has required scopes installed
-- Check `dist/` directory exists after build
-- Review exports/ directory for generated CSV files
+## セキュリティ
 
-## Security Notes
+- 全トークンは`.env`に格納（gitignore対象）
+- `.env`ファイルは絶対にコミットしない
+- 個人データアクセスにはUser Token (xoxp-) が必要
+- アプリ機能にはBot Token (xoxb-)
+- CSVには機密メッセージ内容が含まれる可能性あり - 適切に取り扱うこと
 
-- All tokens are in `.env` (gitignored)
-- Never commit `.env` file
-- User tokens (xoxp-) required for personal data access
-- Bot tokens (xoxb-) for app functionality
-- CSV may contain sensitive message content - handle appropriately
+## 型安全性
 
-## Type Safety
-
-The project uses strict TypeScript with:
-- Explicit return types on public methods
-- Proper typing for Slack API responses
-- Type assertions for WebAPICallResult intersection types
-- No `any` types in production code
-
-## Testing Status
-
-Currently no automated tests configured (`npm test` returns error). When implementing tests:
-- Consider Jest or Mocha for unit tests
-- Mock Slack API calls using @slack/web-api test utilities
-- Test CSV generation with sample data
-- Validate environment variable validation logic
+プロジェクトは厳密なTypeScriptを使用:
+- パブリックメソッドには明示的な戻り値型
+- Slack APIレスポンスの適切な型付け
+- WebAPICallResult交差型の型アサーション
+- プロダクションコードで`any`型は使用しない
